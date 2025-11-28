@@ -28,14 +28,10 @@ class Upsample(nn.Module):
     """Upsample features module"""
     def __init__(self, dim: int):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="bicubic")
-        self.conv = nn.Conv2d(in_channels=dim, 
-                              out_channels=dim, 
-                              kernel_size=3, 
-                              padding=1)
+        self.conv = nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1)
 
     def forward(self, x):
-        return self.conv(self.up(x))
+        return self.conv(x)
 
 
 class Downsample(nn.Module):
@@ -298,7 +294,20 @@ class UNet(nn.Module):
 
         for layer in self.up:
             if isinstance(layer, ResNetAttnBlock):
-                x = layer(torch.cat((x, feats.pop()), dim=1), time_embed)
+                # 获取跳跃连接特征
+                skip_feat = feats.pop()
+                
+                # 确保空间尺寸匹配
+                if skip_feat.shape[-2:] != x.shape[-2:]:
+                    # 使用插值调整skip特征的尺寸以匹配x
+                    skip_feat = torch.nn.functional.interpolate(
+                        skip_feat, 
+                        size=x.shape[-2:], 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                
+                x = layer(torch.cat((x, skip_feat), dim=1), time_embed)
             else:
                 x = layer(x)
 

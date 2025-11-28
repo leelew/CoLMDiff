@@ -49,23 +49,36 @@ class GaussianDiffusion(nn.Module):
 
         solver (str):
             The sampling algorithm used for reverse diffusion, such as:
-                - "base":        ancestral DDPM sampling
+                - "ddpm":        ancestral DDPM sampling
                 - "ddim":        deterministic DDIM sampling
                 - "dpm_solver":  high-order fast ODE-based solvers
             This determines how p(x_{t-1}|x_t) is approximated at inference time.
     """
     def __init__(self,
                  denoiser: nn.Module,
-                 timesteps: int,
-                 objective: str,
-                 conditional: bool,
-                 solver: str):
+                 opt: dict):
         super().__init__()
         self.denoiser = denoiser
-        self.num_timesteps = timesteps
-        self.objective = objective
-        self.conditional = conditional  
-        self.solver = solver
+        self.num_timesteps = opt['model']['timesteps']
+        self.objective = opt['model']['objective']
+        self.conditional = opt['model']['conditional']  
+
+        # for fast sampling
+        self.solver = opt['sample']['solver']
+        if self.solver == 'ddim':
+            self.ddim_sample_steps = opt['sample']['ddim']['ddim_sample_steps']
+            self.ddim_eta = opt['sample']['ddim']['ddim_eta']
+
+        # for guidance sampling
+        self.sample_method = opt['sample']['method']
+        if self.sample_method == 'p(x|y):sdedit':
+            self.start_t = opt['sample']['sdedit']['sdedit_start_t']
+        else:
+            self.start_t = self.num_timesteps - 1
+
+        self.channels = opt['model']['in_channel']
+        self.height = opt['model']['height']
+        self.width = opt['model']['height'] 
 
 ##############################################################################
 # Set up noise schedule
@@ -164,6 +177,24 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer('posterior_mean_coef1', to_torch(betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
         self.register_buffer('posterior_mean_coef2', to_torch((1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
 
+        # DDIM parameters
+        if self.solver == 'ddim':
+            c = self.start_t // self.ddim_sample_steps
+            self.ddim_timesteps = np.asarray(list(range(0, self.start_t, c)))
+    
+            ddim_alphas = self.alphas_cumprod.cpu()[self.ddim_timesteps]
+            ddim_alphas_prev = np.asarray([alphas_cumprod[0]] + alphas_cumprod[self.ddim_timesteps[:-1]].tolist())
+            ddim_sigmas = self.ddim_eta * np.sqrt((1 - ddim_alphas_prev) / (1 - ddim_alphas) * (1 - ddim_alphas / ddim_alphas_prev))
+
+            self.register_buffer('ddim_sigmas', ddim_sigmas)
+            self.register_buffer('ddim_alphas', ddim_alphas)
+            self.register_buffer('ddim_alphas_prev', ddim_alphas_prev)
+            self.register_buffer('ddim_sqrt_one_minus_alphas', np.sqrt(1. - ddim_alphas))
+            sigmas_for_original_sampling_steps = self.ddim_eta * torch.sqrt(
+                (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod) * (
+                            1 - self.alphas_cumprod / self.alphas_cumprod_prev))
+            self.register_buffer('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
+
 ##############################################################################
 # diffusion forward process (q)
 ##############################################################################
@@ -228,31 +259,192 @@ class GaussianDiffusion(nn.Module):
 
         def noise(): return torch.randn(shape, device=device)
         return repeat_noise() if repeat else noise()
+    
+    def _prepare_data_for_sampling(self, x, num_samples, device):
+        """Prepare input data dict for sampling"""
+        img_shape = (num_samples, self.channels, self.height, self.width)
+
+        data_for_sampling = {}
+        if self.sample_method == 'p(x)':
+            x_t = torch.randn(*img_shape, device=device)
+            cond = None
+        elif self.sample_method == 'p(x|y):cond':
+            x_t = torch.randn(*img_shape, device=device)
+            cond = x['cond'].to(device)
+        elif self.sample_method == 'p(x|y):sdedit':
+            x_t = self.q_sample(x_start=x['y'].to(device), t=torch.full((1,), self.start_t, device=device, dtype=torch.long))
+            cond = None
+        elif self.sample_method == 'p(x|y):dps':   
+            x_t = torch.randn(*img_shape, device=device)
+            cond = None
+
+        data_for_sampling['x_t'] = x_t
+        data_for_sampling['cond'] = cond
+        return data_for_sampling
 
     @torch.no_grad()
-    def p_sample(self, x_t, t, x_condition, clip_denoised=True):
+    def p_sample_ddpm(self, x_t, t, x_condition, clip_denoised=True):
         """Sample one step from p(x_{t-1} | x_t)"""
         b, *_, device = *x_t.shape, x_t.device
         model_mean, _, model_log_variance = self.p_mean_variance(x_t, t, x_condition, clip_denoised)
-        noise = self._make_noise(x_t.shape, device, repeat_noise=False)
+        noise = self._make_noise(x_t.shape, device, repeat=False)
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x_t.shape) - 1)))
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise    
+        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+    @torch.no_grad()
+    def p_sample_ddim(self, x_t, t, t_prev, x_condition, clip_denoised=True, eta=0.0):
+        """
+        DDIM sampling: one step from x_t to x_{t_prev}
+        
+        DDIM generalizes DDPM by introducing a parameter η (eta) that controls
+        the stochasticity of the sampling process:
+        - η = 0: deterministic sampling (pure DDIM)
+        - η = 1: equivalent to DDPM sampling
+        
+        The DDIM update rule is:
+        x_{t-1} = √ᾱ_{t-1} · x̂_0 + √(1-ᾱ_{t-1}-σ_t²) · ε_θ(x_t,t) + σ_t · ε
+        
+        where:
+        - x̂_0 is the predicted clean sample
+        - ε_θ(x_t,t) is the predicted noise
+        - σ_t = η · √((1-ᾱ_{t-1})/(1-ᾱ_t)) · √(1-ᾱ_t/ᾱ_{t-1})
+        - ε ~ N(0, I) is random noise
+        
+        Args:
+            x_t: current sample at timestep t
+            t: current timestep
+            t_prev: previous timestep (t-1 or smaller for skipping steps)
+            x_condition: conditional input (if conditional=True)
+            clip_denoised: whether to clip predicted x_0 to [-5, 5]
+            eta: controls stochasticity (0=deterministic, 1=stochastic like DDPM)
+        
+        Returns:
+            x_{t_prev}: sample at timestep t_prev
+        """
+        # Get model prediction
+        if self.conditional:
+            model_output = self.denoiser(torch.cat([x_condition, x_t], dim=1), t)
+        else:
+            model_output = self.denoiser(x_t, t)
+        
+        # Predict x_0 from model output
+        if self.objective == "pred_noise":
+            pred_noise = model_output
+            x_0_pred = self._predict_start_from_noise(x_t, t, pred_noise)
+        elif self.objective == "pred_x0":
+            x_0_pred = model_output
+            # Predict noise from x_0: ε = (x_t - √ᾱ_t · x_0) / √(1-ᾱ_t)
+            pred_noise = (
+                self._extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * 
+                (x_t - self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_0_pred)
+            )
+        
+        # Clip predicted x_0 if needed
+        if clip_denoised:
+            x_0_pred = x_0_pred.clamp(-5., 5.)
+        
+        # Extract alpha values
+        alpha_t = self._extract_into_tensor(self.alphas_cumprod, t, x_t.shape)
+        alpha_t_prev = self._extract_into_tensor(self.alphas_cumprod, t_prev, x_t.shape)
+        
+        # Compute sigma for the stochastic term
+        # σ_t = η · √((1-ᾱ_{t-1})/(1-ᾱ_t)) · √(1-ᾱ_t/ᾱ_{t-1})
+        sigma_t = (
+            eta * 
+            torch.sqrt((1 - alpha_t_prev) / (1 - alpha_t)) * 
+            torch.sqrt(1 - alpha_t / alpha_t_prev)
+        )
+        
+        # Compute the direction pointing to x_t
+        # √(1-ᾱ_{t-1}-σ_t²) · ε_θ(x_t,t)
+        dir_xt_coef = torch.sqrt(1 - alpha_t_prev - sigma_t ** 2)
+        dir_xt = dir_xt_coef * pred_noise
+        
+        # DDIM update: x_{t-1} = √ᾱ_{t-1} · x̂_0 + √(1-ᾱ_{t-1}-σ_t²) · ε_θ + σ_t · ε
+        x_t_prev_mean = torch.sqrt(alpha_t_prev) * x_0_pred + dir_xt
+        
+        # Add stochastic term if eta > 0
+        if eta > 0:
+            noise = torch.randn_like(x_t)
+            x_t_prev = x_t_prev_mean + sigma_t * noise
+        else:
+            x_t_prev = x_t_prev_mean
+        
+        return x_t_prev    
     
     @torch.no_grad()
-    def p_sample_loop(self, x, continuous=False):
+    def p_sample_ddpm_loop(self, x, continuous=False, device=None):
         """Generate samples from p(x_0) by iteratively applying p(x_{t-1} | x_t) from Gaussian noise"""
-        device = self.betas.device
         sample_inter = (1 | (self.num_timesteps // 10))
 
-        shape = (x['x_start'].size(0), 1, x['x_start'].size(2), x['x_start'].size(3))
-        noise = torch.randn(shape, device=device)
+        shape = x['x_t'].shape
+        img = x['x_t'] #torch.randn(shape, device=device)
+        ret_img = img if continuous else None
 
-        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling timestep', total=self.num_timesteps):
-            img = self.p_sample(noise, 
-                                torch.full((shape[0],), i, device=device, dtype=torch.long), # time step t
-                                x['x_condition'] if self.conditional else None, 
-                                clip_denoised=True)
-            if i % sample_inter == 0:
+        for i in tqdm.tqdm(reversed(range(0, self.start_t+1)), desc='DDPM sampling', total=self.start_t):
+            img = self.p_sample_ddpm(img, 
+                                     torch.full((shape[0],), i, device=device, dtype=torch.long), # time step t
+                                     x['cond'] if self.conditional else None, 
+                                     clip_denoised=True)
+            if continuous and i % sample_inter == 0:
+                ret_img = torch.cat([ret_img, img], dim=0)
+        
+        if continuous:
+            return ret_img
+        else:
+            return img
+    
+    @torch.no_grad()
+    def p_sample_ddim_loop(self, x, continuous=False, device=None):
+        """
+        DDIM sampling loop with accelerated sampling using fewer timesteps.
+        
+        DDIM allows skipping timesteps, enabling faster sampling than DDPM.
+        For example, with 1000 training steps, we can sample with only 50 steps.
+        
+        Args:
+            x: dict containing 'x_start' for shape and optionally 'x_condition'
+            ddim_timesteps: number of sampling steps (can be < num_timesteps for acceleration)
+            ddim_eta: controls stochasticity (0=deterministic, 1=stochastic)
+            continuous: whether to return intermediate samples
+        
+        Returns:
+            Generated sample(s)
+        """
+        batch_size = x['x_t'].size(0)
+        
+        # Start from random noise
+        #shape = (batch_size, 1, x['x_t'].size(2), x['x_t'].size(3))
+        img = x['x_t'] #torch.randn(shape, device=device)
+        
+        ddim_timesteps = self.ddim_timesteps.tolist() if isinstance(self.ddim_timesteps, np.ndarray) else self.ddim_timesteps
+
+        # For continuous output
+        sample_inter = max(1, len(ddim_timesteps) // 10)
+        ret_img = img if continuous else None
+        
+        # DDIM sampling loop
+        for i in tqdm.tqdm(reversed(range(len(ddim_timesteps))), desc='DDIM sampling', total=len(ddim_timesteps)):
+            # Determine previous timestep
+            t_curr = ddim_timesteps[i]
+            t_prev = ddim_timesteps[i-1] if i > 0 else 0
+            
+            # Create timestep tensors
+            t_curr_tensor = torch.full((batch_size,), t_curr, device=device, dtype=torch.long)
+            t_prev_tensor = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
+            
+            # DDIM sampling step
+            img = self.p_sample_ddim(
+                img,
+                t_curr_tensor,
+                t_prev_tensor,
+                x['cond'] if self.conditional else None,
+                clip_denoised=True,
+                eta=self.ddim_eta
+            )
+            
+            # Store intermediate results if continuous
+            if continuous and i % sample_inter == 0:
                 ret_img = torch.cat([ret_img, img], dim=0)
         
         if continuous:
@@ -261,14 +453,24 @@ class GaussianDiffusion(nn.Module):
             return img
         
     @torch.no_grad()
-    def sample(self, x, continuous=False):
-        """Generate samples from p(x_0) using different sampling solvers"""
+    def sample(self, x, num_samples, continuous=False, device=None):
+        """
+        Generate samples from p(x_0) using different sampling solvers.
+        
+        Args:
+            x: input dict with 'x_start' and optionally 'x_condition'
+            continuous: whether to return intermediate samples
+            ddim_timesteps: number of sampling steps for DDIM (only used when solver='ddim')
+            ddim_eta: stochasticity parameter for DDIM (0=deterministic, 1=stochastic)
+        
+        Returns:
+            Generated sample(s)
+        """
+        x = self._prepare_data_for_sampling(x, num_samples, device=device)
         if self.solver == 'ddim':
-            pass
-        elif self.solver == 'dpm_solver':
-            pass
-        elif self.solver == 'base':
-            return self.p_sample_loop(x, continuous)
+            return self.p_sample_ddim_loop(x, continuous, device=device)
+        elif self.solver == 'ddpm': 
+            return self.p_sample_ddpm_loop(x, continuous, device=device)
 
 ##############################################################################
 # Calculate loss function for training
@@ -277,12 +479,13 @@ class GaussianDiffusion(nn.Module):
         """Compute the loss function for diffusion model"""
         # diffusion process q(x_t | x_0)
         if noise is None:
-            noise = torch.randn_like(x['x_start'])
-        x_t = self.q_sample(x_start=x['x_start'], t=t, noise=noise)
+            x_start = x['x0'].to(torch.float32)
+            noise = torch.randn(x_start.shape, device=x_start.device, dtype=x_start.dtype)
+        x_t = self.q_sample(x_start=x['x0'], t=t, noise=noise)
 
         # model prediction
         if self.conditional:
-            model_output = self.denoiser(torch.cat([x['x_condition'], x_t], dim=1), t)
+            model_output = self.denoiser(torch.cat([x['cond'], x_t], dim=1), t)
         else:
             model_output = self.denoiser(x_t, t)
         
@@ -290,14 +493,13 @@ class GaussianDiffusion(nn.Module):
         if self.objective == "pred_noise":
             target = noise
         elif self.objective == "pred_x0":
-            target = x['x_start']
-        loss_func = nn.MSELoss(reduction='mean').to(x['x_start'].device)
-        loss = loss_func(target, model_output)
+            target = x['x0']
+        loss = nn.functional.mse_loss(target, model_output, reduction='mean')
         return loss
 
     def forward(self, x): 
         """forward process for training"""
-        t = torch.randint(0, self.num_timesteps, (x['x_start'].size(0),), device=x['x_start'].device).long()
+        t = torch.randint(0, self.num_timesteps, (x['x0'].size(0),), device=x['x0'].device).long()
         return self.p_losses(x, t)
 
         

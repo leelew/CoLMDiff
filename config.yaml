@@ -1,20 +1,19 @@
 model:
   # denoiser
-  height: 64  
-  in_channel: 3
-  out_channel: 3
-  time_embed: 128
-  groups: 32
+  height: 28
+  in_channel: 1
+  out_channel: 1
+  time_embed: 64
+  groups: 16
   dropout: 0.1
-  mults: [1, 2, 4, 8]
-  blocks: 2
-  with_attn_height: [16, 8] 
+  mults: [1, 2]
+  blocks: 1
+  with_attn_height: [14] 
 
   # diffusion
   timesteps: 1000
   objective: 'pred_noise' 
   conditional: false
-  solver: 'base'  
 
 train:
   # init
@@ -32,7 +31,7 @@ train:
   lr: 0.0001
   lr_schedule: 'MultiStepLR'  # 'MultiStepLR', 'CosineAnnealingLR'
   grad_clip: 1.0
-  epochs: 10
+  epochs: 5
   batch_size: 16
   num_data_workers: 6
 
@@ -48,5 +47,17 @@ test:
     'schedule': 'linear'  # 'linear', 'cosine', 'quad', 'warmup10', 'warmup50'
   }
 
+sample:
+  solver: 'ddpm'  # 'ddim', 'ddpm'
+  ddim: {
+    'ddim_sample_steps': 50,
+    'ddim_eta': 0.0
+  }
+  method: 'p(x)'  # 'uniform', 'p(x|y):sdedit'
+  sdedit: {
+    'sdedit_start_t': 700
+  }
+
 path:
-  path_ckp: './checkpoints'
+  path_ckp: './checkpoints' 
+  path_sampling: './sampling/merged.pt'

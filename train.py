@@ -1,38 +1,36 @@
-import argparse
-import yaml
-
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from data_loader import DiffDataset
+from data import TrainDataset
 from model import DDPM
 from trainer import Trainer
+from config import parse_args
 
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train DDPM Model')
-    parser.add_argument('--path_config', type=str, required=True, help='Path to config file')
-    parser.add_argument('--gpu_ids', type=str, default='1,2,3', help='GPU IDs (e.g., 0,1,2,3)')
-    parser.add_argument('--phase', type=str, default='train', choices=['train', 'test'], help='Phase: train or test')
-    return parser.parse_args()
-
-
-def main(train_data, val_data=None):
+def train(train_data=None, val_data=None):
 ##############################################################################
 # Loading configuration
 ##############################################################################
-    args = parse_args()
-    with open(args.path_config, 'r') as f:
-        opt = yaml.safe_load(f)
-    opt["gpu_ids"] = [int(x.strip()) for x in args.gpu_ids.split(',')]
-    opt["phase"] = args.phase
+    opt = parse_args()
     
+    if train_data is None or val_data is None:
+        train_data = {
+            'x_start': torch.from_numpy(np.load(opt["path_data"]+'train_x_start.npy', allow_pickle=True)),
+        }
+        val_data = {
+            'x_start': torch.from_numpy(np.load(opt["path_data"]+'val_x_start.npy', allow_pickle=True)),
+        }
+        if opt.get('conditioned', False):
+            train_data['x_condition'] = torch.from_numpy(np.load(opt["path_data"]+'train_x_condition.npy', allow_pickle=True))
+            val_data['x_condition'] = torch.from_numpy(np.load(opt["path_data"]+'val_x_condition.npy', allow_pickle=True))
+
 ##############################################################################
 # Loading data & create dataloader
 ##############################################################################
     if opt["phase"] == 'train':
-        train_dataset = DiffDataset(opt, train_data['x_start'], train_data.get('x_condition', None))
+        train_dataset = TrainDataset(opt, train_data['x_start'], train_data.get('x_condition', None))
         train_loader = DataLoader(
             train_dataset,
             batch_size=opt['train']['batch_size'],
@@ -42,7 +40,7 @@ def main(train_data, val_data=None):
             drop_last=True
         )
         
-        val_dataset = DiffDataset(opt, val_data['x_start'], val_data.get('x_condition', None))
+        val_dataset = TrainDataset(opt, val_data['x_start'], val_data.get('x_condition', None))
         val_loader = DataLoader(
             val_dataset,
             batch_size=opt['train']['batch_size'],
@@ -66,12 +64,12 @@ def main(train_data, val_data=None):
 
 
 if __name__ == '__main__':
-    train_data = {
-        'x_start': torch.randn(100, 3, 64, 64),
-        'x_condition': torch.randn(100, 3, 64, 64)
-    }
-    val_data = {
-        'x_start': torch.randn(20, 3, 64, 64),
-        'x_condition': torch.randn(20, 3, 64, 64)
-    }
-    main(train_data, val_data)
+    # train_data = {
+    #     'x_start': torch.randn(100, 3, 64, 64),
+    #     'x_condition': torch.randn(100, 3, 64, 64)
+    # }
+    # val_data = {
+    #     'x_start': torch.randn(20, 3, 64, 64),
+    #     'x_condition': torch.randn(20, 3, 64, 64)
+    # }
+    train()

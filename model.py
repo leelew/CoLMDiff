@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torchinfo import summary
 
-from base_model import BaseModel
+from base import BaseModel
 from denoiser import UNet
 from diffusion import GaussianDiffusion
 
@@ -52,14 +52,11 @@ class DDPM(BaseModel):
             num_blocks=opt['model']['blocks'],
             with_attn_height=tuple(opt['model']['with_attn_height'])
         )
-
+    
         # define diffusion model
         self.diffusion = GaussianDiffusion(
             denoiser=self.denoiser,
-            timesteps=opt['model']['timesteps'],
-            objective=opt['model']['objective'],
-            conditional=opt['model']['conditional'],
-            solver=opt['model']['solver'],
+            opt=opt
         )
 
 ##############################################################################
@@ -74,7 +71,9 @@ class DDPM(BaseModel):
 ##############################################################################
         assert torch.cuda.is_available()
         if len(opt['gpu_ids']) > 1: 
-            self.diffusion = nn.DataParallel(self.diffusion)
+            self.diffusion = nn.DataParallel(self.diffusion,
+                                             device_ids=opt['gpu_ids'],           
+                                             output_device=opt['gpu_ids'][0])   
         self.diffusion = self.set_device(self.diffusion)
 
 ##############################################################################
@@ -247,6 +246,8 @@ class DDPM(BaseModel):
         """Load one sample training data into device"""
         self.data = self.set_device(data)
 
+        #print("hello", self.data['x0'].device)
+
     def train_one_sample(self):
         """Train the model using one sample"""
         self.optimizer.zero_grad()
@@ -288,18 +289,18 @@ class DDPM(BaseModel):
         
         # test data for summary
         x = {
-            'x_start': torch.randn(1, self.opt['model']['in_channel'], self.opt['model']['height'], self.opt['model']['height']).to(self.device),
+            'x0': torch.randn(1, self.opt['model']['in_channel'], self.opt['model']['height'], self.opt['model']['height']).to(self.device),
         }
         if self.opt['model']['conditional']:
-            x['x_condition'] = torch.randn(1, self.opt['model']['in_channel'], self.opt['model']['height'], self.opt['model']['height']).to(self.device)
+            x['cond'] = torch.randn(1, self.opt['model']['in_channel'], self.opt['model']['height'], self.opt['model']['height']).to(self.device)
         
-        print("="*80)
+        print("="*50)
         if isinstance(self.diffusion, nn.DataParallel):
             print(f"Model: DataParallel({network.__class__.__name__})")
             print(f"GPUs: {len(self.opt['gpu_ids'])}")
         else:
             print(f"Model: {network.__class__.__name__}")
-        print("="*80)
+        print("="*50)
         
         # Print detailed summary
         summary(
@@ -310,7 +311,6 @@ class DDPM(BaseModel):
             row_settings=["var_names"],
             verbose=1
         )
-        print("="*80)
 
     def save_network(self, epoch: int) -> None:
         """Saves the network checkpoint."""
@@ -333,15 +333,25 @@ class DDPM(BaseModel):
 
     def load_network(self) -> None:
         """Load network parameters from checkpoint."""
-        if self.opt['train']['pretrained'] is None:
+        if self.opt['phase'] == 'eval':
             network = self.diffusion.module if isinstance(self.diffusion, nn.DataParallel) else self.diffusion
 
-            checkpoint = torch.load(self.path_ckp, map_location=self.device)
+            if os.path.isdir(self.path_ckp):
+                checkpoint_files = [f for f in os.listdir(self.path_ckp) if f.endswith('.pth')]
+                if not checkpoint_files:
+                    raise FileNotFoundError(f"No checkpoint files found in {self.path_ckp}")
+                
+                checkpoint_files.sort(key=lambda x: int(x.split('_E')[-1].split('.')[0]))
+                checkpoint_path = os.path.join(self.path_ckp, checkpoint_files[-1])
+                print(f"Loading checkpoint: {checkpoint_path}")
+
+            print(self.device)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
             network.load_state_dict(checkpoint['model'], strict=True)
-            
-            if self.opt['phase'] == 'train':
-                self.optimizer.load_state_dict(checkpoint['optimizer'])
-                self.scheduler.load_state_dict(checkpoint['lr_schedule'])
-                self.begin_epoch = checkpoint.get('epoch', 0)
-                    
+        
+        #if self.opt['phase'] == 'train':
+            # self.optimizer.load_state_dict(checkpoint['optimizer'])
+            # self.scheduler.load_state_dict(checkpoint['lr_schedule'])
+            # self.begin_epoch = checkpoint.get('epoch', 0)
+                
             print("Checkpoint loaded successfully")

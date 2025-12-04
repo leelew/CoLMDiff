@@ -6,21 +6,31 @@ from torchinfo import summary
 
 
 class TimeEmbedding(nn.Module):
-    """Sinusoidal time embedding module"""
-    def __init__(self, dim: int):
+    """time embedding module"""
+    def __init__(self, dim: int, scale: float=30.0):
         super().__init__()
         self.dim = dim
-        inv_freq = torch.exp(
+        inv_freq = torch.exp(            
             torch.arange(0, dim, 2, dtype=torch.float32) *
             (-math.log(10000) / dim)
         )
         self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("W", torch.randn(dim // 2) * scale)
 
-    def forward(self, input):
-        shape = input.shape
-        sinusoid_in = torch.ger(input.view(-1).float(), self.inv_freq)
-        time_emb = torch.cat([sinusoid_in.sin(), sinusoid_in.cos()], dim=-1)
-        time_emb = time_emb.view(*shape, self.dim)
+    def forward(self, input, embed_method='Gaussian'):       
+        if embed_method == 'Gaussian':
+            # Gaussian Random Fourier Features
+            # Projects timestep to frequency space using random frequencies
+            # Ensure W is on the same device as input
+            freq_proj = input[:, None] * self.W[None, :] * 2 * math.pi  
+            time_emb = torch.cat([torch.sin(freq_proj), torch.cos(freq_proj)], dim=-1)    
+        elif embed_method == 'Sinusoidal':
+            # Sinusoidal Positional Encoding (Transformer-style)
+            # Uses fixed frequencies with exponential decay
+            freq_proj = input[:, None].float() * self.inv_freq[None, :] 
+            time_emb = torch.cat([torch.sin(freq_proj), torch.cos(freq_proj)], dim=-1)  
+        else:
+            raise ValueError(f"Unknown embed_method: {embed_method}. Choose 'Gaussian' or 'Sinusoidal'.")
         return time_emb
 
 
@@ -152,7 +162,7 @@ class UNet(nn.Module):
     conditioning via time embeddings and optional spatial self-attention.
 
     Args:
-        height (int): 
+        img_size (int): 
             The initial input height (and width, assuming square input) of the feature map.
             Used to determine which layers include attention and to compute resolution changes
             during downsampling and upsampling.
@@ -163,68 +173,63 @@ class UNet(nn.Module):
         out_channel (int): 
             Number of output channels of the final convolution layer (usually same as input).
 
-        time_dim (int): 
+        embed_dim (int): 
             Dimensionality of the time embedding vector, which conditions each block
             on the diffusion timestep or other temporal variable.
 
-        groups (int): 
+        norm_groups (int): 
             Number of groups used in Group Normalization inside each block.
 
         dropout (float): 
             Dropout rate applied within residual blocks to prevent overfitting.
 
-        mults (tuple): 
+        channel_mults (tuple): 
             Channel expansion multipliers for each downsampling stage.
             For example, `(1, 2, 4, 8)` means that channels are scaled by these factors
-            relative to `time_dim` at each level.
+            relative to `embed_dim` at each level.
 
         num_blocks (int): 
             Number of residual-attention blocks (`ResNetAttnBlock`) per resolution level.
-
-        with_attn_height (tuple): 
-            A tuple of spatial resolutions (heights) at which self-attention
-            is applied within the network. Typically includes smaller spatial sizes
-            (e.g., `(16, 8)`) to capture global context when feature maps are compact.
     """
 
     def __init__(
             self,
-            height: int,
+            img_size: int,
             in_channel: int,
             out_channel: int, 
-            time_dim: int,
-            groups: int,
+            embed_dim: int,
+            norm_groups: int,
             dropout: float,
-            mults: tuple,
+            channel_mults: tuple,
             num_blocks: int,
-            with_attn_height: tuple
     ):
         super().__init__()
 
         # MLP for time embedding
         self.time_mlp = nn.Sequential(
-            TimeEmbedding(time_dim),
-            nn.Linear(time_dim, time_dim * 4),
+            TimeEmbedding(embed_dim),
+            nn.Linear(embed_dim, embed_dim * 4),
             nn.SiLU(),
-            nn.Linear(time_dim * 4, time_dim)
+            nn.Linear(embed_dim * 4, embed_dim)
         )
 
         # hyperparameters for UNet
-        num_mults = len(mults)
-        pre_channel = time_dim
+        num_mults = len(channel_mults)
+        pre_channel = embed_dim
         feat_channel = [pre_channel]
+        with_attn_height = [embed_dim / 4, embed_dim / 8] # own choice
 
         # Downsampling layers
-        down = [nn.Conv2d(in_channel, time_dim, kernel_size=3, padding=1)]
+        down = [nn.Conv2d(in_channel, embed_dim, kernel_size=3, padding=1)]
         for ind in range(num_mults):
-            aft_channel = mults[ind] * time_dim
-            use_attn = (height in with_attn_height)
+            aft_channel = channel_mults[ind] * embed_dim
+            use_attn = (img_size in with_attn_height)
 
             for _ in range(num_blocks):
                 down.append(ResNetAttnBlock(pre_channel, 
                                             aft_channel, 
-                                            time_dim,
-                                            groups, 
+                                            embed_dim,
+                                            norm_groups, 
                                             dropout,
                                             with_attn=use_attn))
                 feat_channel.append(aft_channel)
@@ -233,21 +238,21 @@ class UNet(nn.Module):
             if ind != num_mults - 1:
                 down.append(Downsample(pre_channel))
                 feat_channel.append(pre_channel)
-                height = height // 2
+                img_size = img_size // 2
         self.down = nn.ModuleList(down)
 
         # Middle layers
         self.mid = nn.ModuleList([
             ResNetAttnBlock(pre_channel, 
                             pre_channel, 
-                            time_dim,
-                            groups, 
+                            embed_dim,
+                            norm_groups, 
                             dropout,
                             with_attn=True),
             ResNetAttnBlock(pre_channel, 
                             pre_channel, 
-                            time_dim,
-                            groups, 
+                            embed_dim,
+                            norm_groups, 
                             dropout,
                             with_attn=False)
             ])
@@ -255,25 +260,25 @@ class UNet(nn.Module):
         # Upsampling layers
         up = []
         for ind in reversed(range(num_mults)):
-            aft_channel = mults[ind] * time_dim
-            use_attn = (height in with_attn_height)
+            aft_channel = channel_mults[ind] * embed_dim
+            use_attn = (img_size in with_attn_height)
 
             for _ in range(0, num_blocks + 1):
                 up.append(ResNetAttnBlock(pre_channel + feat_channel.pop(), 
                                           aft_channel, 
-                                          time_dim,
-                                          groups, 
+                                          embed_dim,
+                                          norm_groups, 
                                           dropout,
                                           with_attn=use_attn))
                 pre_channel = aft_channel
 
             if ind != 0:
                 up.append(Upsample(pre_channel))
-                height = height * 2
+                img_size = img_size * 2
         self.up = nn.ModuleList(up) 
 
         # final convolution layer
-        self.final_conv = Block(pre_channel, out_channel, groups)
+        self.final_conv = Block(pre_channel, out_channel, norm_groups)
 
     def forward(self, x, time=None):
         time_embed = self.time_mlp(time) if time is not None else None
@@ -294,12 +299,9 @@ class UNet(nn.Module):
 
         for layer in self.up:
             if isinstance(layer, ResNetAttnBlock):
-                # 获取跳跃连接特征
                 skip_feat = feats.pop()
                 
-                # 确保空间尺寸匹配
                 if skip_feat.shape[-2:] != x.shape[-2:]:
-                    # 使用插值调整skip特征的尺寸以匹配x
                     skip_feat = torch.nn.functional.interpolate(
                         skip_feat, 
                         size=x.shape[-2:], 
@@ -313,6 +315,35 @@ class UNet(nn.Module):
 
         return self.final_conv(x)
 
+
+
+class LinearNet(nn.Module):
+    """denoiser for 1D data"""
+    def __init__(self, in_channel, embed_dim):
+        super().__init__()
+        self.dim = in_channel
+        self.num_layers = 2
+        self.embed_dim = embed_dim
+
+        self.embed = nn.Sequential(TimeEmbedding(embed_dim),
+                                   nn.Linear(embed_dim, embed_dim))
+        self.input = nn.Linear(in_channel, embed_dim)
+        self.fc_all = nn.ModuleList([nn.Linear(embed_dim, embed_dim) for _ in range(self.num_layers)])
+        self.output = nn.Linear(embed_dim, in_channel)
+        self.bn = nn.ModuleList([nn.BatchNorm1d(embed_dim) for _ in range(self.num_layers)])
+        self.act = nn.SiLU()
+
+    def forward(self, x, time=None):
+        embed = self.act(self.embed(time)) if time is not None else 0
+
+        h = self.input(x)
+        for i in range(self.num_layers):
+            h = h + self.act(self.fc_all[i](h) + embed)
+            h = self.bn[i](h)
+        h = self.output(h)
+        return h
+    
+    
 
 
 if __name__ == "__main__":

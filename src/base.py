@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 
 
 
@@ -35,11 +34,3 @@ class BaseModel():
         else:
             x = x.to(self.device)
         return x
-
-    def get_network_description(self, network):
-        '''Get the string and total parameters of the network'''
-        if isinstance(network, nn.DataParallel):
-            network = network.module
-        s = str(network)
-        n = sum(map(lambda x: x.numel(), network.parameters()))
-        return s, n

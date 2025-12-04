@@ -12,85 +12,58 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from tqdm import tqdm
 
+from .data import TrainDataset
+from torch.utils.data import DataLoader
+
 
 
 class Trainer:
-    """Class for train and evaluation of the model"""
+    """Class for train and sampling of the model"""
     
     def __init__(self, model, opt):
         self.model = model
         self.opt = opt
-        
-        print("="*80)
-        print("Trainer initialized successfully")
-        print(f"  Device: {self.model.device}")
-        print(f"  Multi-GPU: {isinstance(self.model.diffusion, nn.DataParallel)}")
-        if isinstance(self.model.diffusion, nn.DataParallel):
-            print(f"  GPU Count: {len(opt['gpu_ids'])}")
-        print("="*80)
     
-    def train(self, train_loader, val_loader=None):
-        print("\n" + "="*80)
-        print("Starting Training")
-        print("="*80)
+    def train(self, x):
+        train_dataset = TrainDataset(x['x0'], x.get('cond', None))
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.opt['train']['batch_size'],
+            shuffle=True,
+            num_workers=self.opt['train'].get('num_data_workers', 6),
+            pin_memory=True,
+            drop_last=True
+        )
         
+        self.model.set_diffusion_schedule(self.opt['train']['noise_schedule'])
         self.model.diffusion.train()
-        train_losses = []
 
         for epoch in range(self.opt['train']['epochs']):
-            # train
-            self.model.diffusion.train()
-
             epoch_loss = 0
             num_batches = len(train_loader)
             pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{self.opt["train"]["epochs"]}')
 
             for _, train_data in enumerate(pbar):
-                # train one sample
                 self.model.load_one_sample(train_data)
                 self.model.train_one_sample()
-
-                # update scheduler
                 self.model.scheduler.step()
 
-                # print loss
                 loss = self.model.log_dict['loss']
                 epoch_loss += loss
                 pbar.set_postfix({'loss': f'{loss:.3f}'})
 
-            # logging train info
             avg_train_loss = epoch_loss / num_batches
-            train_losses.append(avg_train_loss)
             
-            print(f"\n{'='*80}")
             print(f"Epoch {epoch} Summary:")
-            print(f"  Train Loss: {avg_train_loss:.4f}")
+            print(f"  Train Loss: {avg_train_loss:.4f}") 
 
             if (epoch + 1) % self.opt['train']['save_epoch_freq'] == 0:
                 self.model.save_network(epoch)
 
-    def _sample_worker(self, rank, world_size, n_per_gpu, model, x_per_gpu, path_sampling):
-        device = self.opt['gpu_ids'][rank]
-        dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
-        torch.cuda.set_device(device)
+    def sampling(self, x_total, n_total, operator=None):
+        self.model.set_diffusion_schedule(self.opt['sample']['noise_schedule'])
+        self.model.diffusion.eval()
 
-        model_i = model.to(device)
-        if isinstance(x_per_gpu, dict):
-            for key, item in x_per_gpu.items():
-                if item is not None:
-                    x_per_gpu[key] = item.to(device)
-
-        x_gen = model_i.sample(x_per_gpu, n_per_gpu, device=device)
-        final = x_gen.detach().cpu()
-
-        dist.all_gather(gathered := [torch.zeros_like(final, device=device) for _ in range(world_size)], final.to(device))
-        if rank == 0:
-            merged = torch.cat([g.cpu() for g in gathered], dim=0)
-            torch.save(merged, path_sampling)
-
-        dist.destroy_process_group()
-
-    def sampling(self, x_total, n_total, path_sampling):
         gpus = [f"cuda:{i}" for i in self.opt['gpu_ids']]
         world_size = len(gpus)
 
@@ -101,6 +74,9 @@ class Trainer:
 
         y = x_total.get('y', None)
         cond = x_total.get('cond', None)
+
+        manager = mp.Manager()
+        out_dict = manager.dict()
 
         procs = []
         for i in range(world_size):
@@ -113,28 +89,70 @@ class Trainer:
 
             if n_i == 0:
                 continue
-            p = mp.Process(target=self._sample_worker, args=(i, world_size, n_i, self.model.diffusion.module, x_per_gpu, path_sampling))
+            p = mp.Process(target=self._sample_worker, args=(i, world_size, n_i, self.model.diffusion.module, x_per_gpu, operator, out_dict))
             p.start()
             procs.append(p)
 
         for p in procs:
             p.join()
 
-        if os.path.exists(path_sampling):
-            merged = torch.load(path_sampling, map_location="cpu", weights_only=False)
-            print(merged.dtype)
-            print(merged.shape)
-            return merged
-        else:
-            raise FileNotFoundError("Merged sampling file not found.")
+        if 'samples' in out_dict:
+            samples = out_dict['samples'].numpy()
+            return samples
     
+    def _sample_worker(self, rank, world_size, n_per_gpu, model, x_per_gpu, operator=None, out_dict=None):
+        device = self.opt['gpu_ids'][rank]
+        dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+        torch.cuda.set_device(device)
 
+        model_i = model.to(device)
+        for name, buffer in model_i.named_buffers():
+            if buffer.device != device:
+                buffer.data = buffer.data.to(device)
+
+        if isinstance(x_per_gpu, dict):
+            for key, item in x_per_gpu.items():
+                if item is not None:
+                    x_per_gpu[key] = item.to(device)
+        x_gen = model_i.sample(x_per_gpu, n_per_gpu, operator=operator, device=device) 
+        final = x_gen.detach().cpu()
+
+        dist.all_gather(gathered := [torch.zeros_like(final, device=device) for _ in range(world_size)], final.to(device))
+        if rank == 0:
+            merged = torch.cat([g.cpu() for g in gathered], dim=0)
+            out_dict['samples'] = merged 
+
+        dist.destroy_process_group()
+
+    def finetune(self, finetune_data, finetune_epochs=100):
+        finetune_dataset = TrainDataset(finetune_data['x0'], finetune_data.get('cond', None))
+        finetune_loader = DataLoader(
+            finetune_dataset,
+            batch_size=min(self.opt['train']['batch_size'], len(finetune_dataset)),
+            shuffle=True,
+            num_workers=self.opt['train'].get('num_data_workers', 6),
+            pin_memory=True,
+            drop_last=True
+        )
+
+        self.model.set_diffusion_schedule(self.opt['train']['noise_schedule'])
+        self.model.diffusion.train()
+
+        for epoch in range(finetune_epochs):            
+            epoch_loss = 0
+            num_batches = len(finetune_loader)
+            pbar = tqdm(finetune_loader, desc=f'Epoch {epoch}/{finetune_epochs}')
             
-
-
-
-
-
+            for _, finetune_batch in enumerate(pbar):
+                self.model.load_one_sample(finetune_batch)
+                self.model.train_one_sample()
+                self.model.scheduler.step()
                 
-
-
+                loss = self.model.log_dict['loss']
+                epoch_loss += loss
+                pbar.set_postfix({'loss': f'{loss:.3f}'})
+            
+            avg_finetune_loss = epoch_loss / num_batches
+            
+            print(f" Epoch {epoch} Summary:")
+            print(f"   Loss: {avg_finetune_loss:.4f}")

@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torchinfo import summary
 
-from base import BaseModel
-from denoiser import UNet
-from diffusion import GaussianDiffusion
+from .base import BaseModel
+from .denoiser import UNet, LinearNet
+from .diffusion import GaussianDiffusion
 
 
 
@@ -41,17 +41,22 @@ class DDPM(BaseModel):
 # Define model architecture by options
 ##############################################################################
         # define denoiser network
-        self.denoiser = UNet(
-            height=opt['model']['height'],
-            in_channel=opt['model']['in_channel'],
-            out_channel=opt['model']['out_channel'],
-            time_dim=opt['model']['time_embed'],
-            groups=opt['model']['groups'],
-            dropout=opt['model']['dropout'],
-            mults=tuple(opt['model']['mults']),
-            num_blocks=opt['model']['blocks'],
-            with_attn_height=tuple(opt['model']['with_attn_height'])
-        )
+        if opt['model']['2d']:
+            self.denoiser = UNet(
+                img_size=opt['model']['height_2d'],
+                in_channel=opt['model']['in_channel_2d'],
+                out_channel=opt['model']['out_channel_2d'],
+                embed_dim=opt['model']['embed_dim'], 
+                norm_groups=opt['model']['groups'],
+                dropout=opt['model']['dropout'],
+                channel_mults=tuple(opt['model']['channel_mults']),
+                num_blocks=opt['model']['num_blocks']
+            )
+        elif opt['model']['1d']:
+            self.denoiser = LinearNet(
+                in_channel=opt['model']['in_channel_1d'],
+                embed_dim=opt['model']['embed_dim'] 
+            )
     
         # define diffusion model
         self.diffusion = GaussianDiffusion(
@@ -80,9 +85,7 @@ class DDPM(BaseModel):
 # Setup noise schedule for both training or validation phase (?)
 ##############################################################################
         if opt['phase'] == 'train':
-            self.set_diffusion_schedule(opt['train']['noise_schedule'])
-        else:
-            self.set_diffusion_schedule(opt['test']['noise_schedule'])
+            self.set_diffusion_schedule(opt['train']['noise_schedule']) 
 
 ##############################################################################
 # Define optimizers and learning schedulers for training phase
@@ -103,11 +106,6 @@ class DDPM(BaseModel):
             self.log_dict = OrderedDict()
 
 ##############################################################################
-# Load pretrained model if needed
-##############################################################################
-        self.load_network()
-
-##############################################################################
 # print model information for diagnosis
 ##############################################################################
         self.print_network()
@@ -118,6 +116,9 @@ class DDPM(BaseModel):
     def _weights_init_normal(self, model: nn.Module, std: float = 0.02) -> None:
         """Initializes model weights from Gaussian distribution."""
         classname = model.__class__.__name__
+        if classname in ['LinearNet', 'UNet', 'GaussianDiffusion', 'Sequential', 
+                        'ModuleList', 'ModuleDict', 'DataParallel']:
+            return
         if classname.find("Conv") != -1:
             nn.init.normal_(model.weight.data, 0.0, std)
             if model.bias is not None:
@@ -133,6 +134,9 @@ class DDPM(BaseModel):
     def _weights_init_kaiming(self, model: nn.Module, scale: float = 1) -> None:
         """He initialization of model weights."""
         classname = model.__class__.__name__
+        if classname in ['LinearNet', 'UNet', 'GaussianDiffusion', 'Sequential', 
+                        'ModuleList', 'ModuleDict', 'DataParallel']:
+            return
         if classname.find("Conv2d") != -1:
             nn.init.kaiming_normal_(model.weight.data)
             model.weight.data *= scale
@@ -150,6 +154,9 @@ class DDPM(BaseModel):
     def _weights_init_orthogonal(self, model: nn.Module) -> None:
         """Fills the model weights to be orthogonal matrices."""
         classname = model.__class__.__name__
+        if classname in ['LinearNet', 'UNet', 'GaussianDiffusion', 'Sequential', 
+                        'ModuleList', 'ModuleDict', 'DataParallel']:
+            return
         if classname.find("Conv") != -1:
             nn.init.orthogonal_(model.weight.data)
             if model.bias is not None:
@@ -246,15 +253,14 @@ class DDPM(BaseModel):
         """Load one sample training data into device"""
         self.data = self.set_device(data)
 
-        #print("hello", self.data['x0'].device)
-
     def train_one_sample(self):
         """Train the model using one sample"""
         self.optimizer.zero_grad()
 
         # forward pass
         loss = self.diffusion(self.data)
-        loss = loss.mean()
+        if loss.dim() > 0:
+            loss = loss.mean()
 
         # backward pass
         loss.backward()
@@ -272,27 +278,28 @@ class DDPM(BaseModel):
         # log loss
         self.log_dict['loss'] = loss.item()
 
-    def test_one_sample(self, continuous=False):
-        """Generate one sample using the diffusion model"""
-        self.diffusion.eval()
-        with torch.no_grad():
-            if isinstance(self.diffusion, nn.DataParallel):
-                self.output = self.diffusion.module.sample(self.data, continuous)
-            else:
-                self.output = self.diffusion.sample(self.data, continuous)
-        self.diffusion.train()
-
     def print_network(self) -> None:
         """Prints the network architecture using torchinfo."""
         # Get the actual model (handle DataParallel)
         network = self.diffusion.module if isinstance(self.diffusion, nn.DataParallel) else self.diffusion
         
-        # test data for summary
-        x = {
-            'x0': torch.randn(1, self.opt['model']['in_channel'], self.opt['model']['height'], self.opt['model']['height']).to(self.device),
-        }
-        if self.opt['model']['conditional']:
-            x['cond'] = torch.randn(1, self.opt['model']['in_channel'], self.opt['model']['height'], self.opt['model']['height']).to(self.device)
+        # Create dummy input based on model type
+        if self.opt['model']['2d']:
+            x = {
+                'x0': torch.randn(1, self.opt['model']['in_channel_2d'], 
+                                self.opt['model']['height_2d'], 
+                                self.opt['model']['width_2d']).to(self.device),
+            }
+            if self.opt['model']['conditional']:
+                x['cond'] = torch.randn(1, self.opt['model']['in_channel_2d'], 
+                                    self.opt['model']['height_2d'], 
+                                    self.opt['model']['width_2d']).to(self.device)
+        elif self.opt['model']['1d']:
+            x = {
+                'x0': torch.randn(1, self.opt['model']['in_channel_1d']).to(self.device),
+            }
+            if self.opt['model']['conditional']:
+                x['cond'] = torch.randn(1, self.opt['model']['in_channel_1d']).to(self.device)
         
         print("="*50)
         if isinstance(self.diffusion, nn.DataParallel):
@@ -333,7 +340,7 @@ class DDPM(BaseModel):
 
     def load_network(self) -> None:
         """Load network parameters from checkpoint."""
-        if self.opt['phase'] == 'eval':
+        if self.opt['phase'] == 'sample':
             network = self.diffusion.module if isinstance(self.diffusion, nn.DataParallel) else self.diffusion
 
             if os.path.isdir(self.path_ckp):
@@ -345,13 +352,6 @@ class DDPM(BaseModel):
                 checkpoint_path = os.path.join(self.path_ckp, checkpoint_files[-1])
                 print(f"Loading checkpoint: {checkpoint_path}")
 
-            print(self.device)
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             network.load_state_dict(checkpoint['model'], strict=True)
-        
-        #if self.opt['phase'] == 'train':
-            # self.optimizer.load_state_dict(checkpoint['optimizer'])
-            # self.scheduler.load_state_dict(checkpoint['lr_schedule'])
-            # self.begin_epoch = checkpoint.get('epoch', 0)
-                
             print("Checkpoint loaded successfully")

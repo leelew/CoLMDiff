@@ -1,0 +1,77 @@
+phase: 'train' # 'train', 'sample', 'finetune'
+
+model:
+  # input data (if 2D) dimensions
+  2d: false
+  height_2d: 28
+  width_2d: 28
+  in_channel_2d: 1
+  out_channel_2d: 1
+
+  # input data (if 1D) dimensions
+  1d: true 
+  in_channel_1d: 10
+
+  # time embedding parameters
+  embed_dim: 64
+  embed_method: 'Gaussian'  # 'Sinusoidal', 'Gaussian'
+
+  # denoise model architecture parameters (2D, Unet-like)
+  norm_groups: 16
+  dropout: 0.1
+  channel_mults: [1, 2]
+  num_blocks: 1
+
+  # diffusion model parameters
+  timesteps: 1000
+  objective: 'pred_eps'  # 'pred_x0', 'pred_eps', 'pred_v', 'pred_score'
+  conditional: false
+
+train:
+  # init
+  init_method: 'kaiming' 
+
+  # train noise schedule
+  noise_schedule: {
+    'linear_start': 0.0001,
+    'linear_end': 0.02,
+    'schedule': 'linear'  # 'linear', 'cosine', 'quad', 'warmup10', 'warmup50'
+  }
+
+  # training parameters
+  optimizer: 'Adam'  # 'Adam', 'AdamW'
+  lr: 0.0001
+  lr_schedule: 'MultiStepLR'  # 'MultiStepLR', 'CosineAnnealingLR'
+  grad_clip: 1.0
+  epochs: 1
+  batch_size: 64
+  num_data_workers: 6
+  save_epoch_freq: 5
+
+sample:
+  # sample noise schedule
+  noise_schedule: {
+      'linear_start': 0.0001,
+      'linear_end': 0.02,
+      'schedule': 'linear'  # 'linear', 'cosine', 'quad', 'warmup10', 'warmup50'
+    }
+
+  # sampling solver
+  solver: 'ddpm'  # 'ddpm', 'ddim'
+
+  # DDIM sampling parameters
+  ddim: {
+    'ddim_sample_steps': 50,
+    'ddim_eta': 0.0  # [0,1], 0 corresponds to deterministic sampling
+  }
+
+  # sampling method for inverse problems
+  method: 'p(x|y):dps'  # 'p(x)', 'p(x|y):cond', 'p(x|y):sdedit', 'p(x|y):dps'
+
+  # SDEdit sampling parameters
+  sdedit: {
+    'sdedit_start_t': 700
+  }
+
+path:
+  path_ckp: './checkpoints'

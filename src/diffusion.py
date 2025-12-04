@@ -25,7 +25,7 @@ class GaussianDiffusion(nn.Module):
 
         objective (str):
             The training target of the diffusion model:
-                - "pred_noise":     model predicts the added noise ε_t
+                - "pred_eps":     model predicts the added noise ε_t
                 - "pred_x0":        model predicts the clean signal x0
             Determines how x0 and noise are reconstructed during training and sampling.
 
@@ -59,6 +59,7 @@ class GaussianDiffusion(nn.Module):
                  opt: dict):
         super().__init__()
         self.denoiser = denoiser
+        self.opt = opt
         self.num_timesteps = opt['model']['timesteps']
         self.objective = opt['model']['objective']
         self.conditional = opt['model']['conditional']  
@@ -76,9 +77,6 @@ class GaussianDiffusion(nn.Module):
         else:
             self.start_t = self.num_timesteps - 1
 
-        self.channels = opt['model']['in_channel']
-        self.height = opt['model']['height']
-        self.width = opt['model']['height'] 
 
 ##############################################################################
 # Set up noise schedule
@@ -235,23 +233,37 @@ class GaussianDiffusion(nn.Module):
             self._extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             self._extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
-
-    def p_mean_variance(self, x_t, t, x_condition, clip_denoised=True):
-        """Get the distribution p(x_{t-1} | x_t), equally q(x_{t-1} | x_t, x_0) with x_0 predicted by model"""
-        if self.conditional:
-            model_output = self.denoiser(torch.cat([x_condition, x_t], dim=1), t)
-        else:
-            model_output = self.denoiser(x_t, t)
-
-        if self.objective == "pred_noise":
-            x_start_pred = self._predict_start_from_noise(x_t, t=t, noise=model_output)
-        elif self.objective == "pred_x0":
-            x_start_pred = model_output
-        if clip_denoised:
-            x_start_pred.clamp_(-5., 5.)
-
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start_pred, x_t=x_t, t=t)
-        return model_mean, posterior_variance, posterior_log_variance
+    
+    def _predict_start_from_score(self, x_t, t, score):
+        sqrt_alpha_bar = self._extract_into_tensor(
+            self.sqrt_alphas_cumprod, t, x_t.shape
+        )
+        one_minus_alpha_bar = self._extract_into_tensor(
+            self.sqrt_one_minus_alphas_cumprod, t, x_t.shape
+        ) ** 2
+        x_start = (x_t + one_minus_alpha_bar * score) / sqrt_alpha_bar
+        return x_start
+    
+    def _predict_score_from_noise(self, x_t, t, noise):
+        score = - noise / self._extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+        return score
+    
+    def _predict_score_from_start(self, x_t, t, x_start):
+        sqrt_alpha_bar = self._extract_into_tensor(
+            self.sqrt_alphas_cumprod, t, x_t.shape
+        )
+        one_minus_alpha_bar = self._extract_into_tensor(
+            self.sqrt_one_minus_alphas_cumprod, t, x_t.shape
+        ) ** 2
+        score = (sqrt_alpha_bar * x_start - x_t) / one_minus_alpha_bar # Tweedie's formula
+        return score
+    
+    def _predict_noise_from_start(self, x_t, t, x_start):
+        noise = (
+            self._extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * 
+            (x_t - self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_start)
+        )
+        return noise
     
     def _make_noise(self, shape, device, repeat=False):
         def repeat_noise(): return torch.randn(
@@ -261,38 +273,192 @@ class GaussianDiffusion(nn.Module):
         return repeat_noise() if repeat else noise()
     
     def _prepare_data_for_sampling(self, x, num_samples, device):
-        """Prepare input data dict for sampling"""
-        img_shape = (num_samples, self.channels, self.height, self.width)
+        """
+        Prepare data dictionary for sampling
+        
+        This function initializes the starting point x_T and auxiliary data for 
+        the reverse diffusion process based on the chosen sampling method.
+        
+        Args:
+            x: Input data dictionary (content depends on sample_method):
+                - For 'p(x)': Can be None or empty dict (unconditional generation)
+                - For 'p(x|y):cond': Must contain 'cond' key with conditioning input
+                - For 'p(x|y):sdedit': Must contain 'y' key with reference image
+                - For 'p(x|y):dps': Must contain 'y' key with measurement/observation
+            
+            num_samples: Number of samples to generate
+            
+            device: Device to place tensors on (cuda or cpu)
+        
+        Returns:
+            data_for_sampling: Dictionary containing:
+                - 'x_t': Initial noise or noisy image at timestep T
+                        Shape depends on denoiser type:
+                        * LinearNet: [num_samples, channels]
+                        * UNet: [num_samples, channels, height, width]
+                
+                - 'cond': Conditioning input (for conditional generation)
+                        Shape matches input data dimension
+                        None if not using conditional generation
+                
+                - 'y': Reference/observation data (for guided generation)
+                    Shape matches input data dimension
+                    None if not using guidance
+        
+        Sampling Methods:
+            1. 'p(x)' - Unconditional Generation:
+            - Generates samples from scratch using pure noise
+            - x_t ~ N(0, I): Random Gaussian noise
+            - No conditioning or guidance
+            
+            2. 'p(x|y):cond' - Conditional Generation:
+            - Generates samples conditioned on input 'cond'
+            - x_t ~ N(0, I): Start from noise
+            - cond: Conditioning signal (e.g., class label, text embedding, low-res image)
+            - Model input: concat([cond, x_t]) at each denoising step
+            
+            3. 'p(x|y):sdedit' - SDEdit (Stochastic Differential Editing):
+            - Edits/refines a reference image 'y'
+            - x_t = q_sample(y, t=start_t): Add noise to 'y' up to timestep start_t
+            - Then denoise from start_t to 0 (partial diffusion process)
+            - Preserves structure of 'y' while allowing controlled edits
+            
+            4. 'p(x|y):dps' - Diffusion Posterior Sampling:
+            - Generates samples that match observation 'y' under operator A
+            - x_t ~ N(0, I): Start from noise
+            - Uses measurement y and observation operator during sampling
+            - Guides generation via likelihood score ∇log p(y|x_0)
+        """        
+        if self.opt['model']['1d']:
+            img_shape = (num_samples, self.opt['model']['in_channel_1d'])
+        elif self.opt['model']['2d']:
+            img_shape = (num_samples, self.opt['model']['in_channel_2d'], self.opt['model']['height_2d'], self.opt['model']['width_2d'])
 
         data_for_sampling = {}
         if self.sample_method == 'p(x)':
             x_t = torch.randn(*img_shape, device=device)
             cond = None
+            y = None
         elif self.sample_method == 'p(x|y):cond':
             x_t = torch.randn(*img_shape, device=device)
             cond = x['cond'].to(device)
+            y = None
         elif self.sample_method == 'p(x|y):sdedit':
             x_t = self.q_sample(x_start=x['y'].to(device), t=torch.full((1,), self.start_t, device=device, dtype=torch.long))
             cond = None
+            y = x['y'].to(device)
         elif self.sample_method == 'p(x|y):dps':   
             x_t = torch.randn(*img_shape, device=device)
             cond = None
+            y = x['y'].to(device)
 
         data_for_sampling['x_t'] = x_t
         data_for_sampling['cond'] = cond
+        data_for_sampling['y'] = y
         return data_for_sampling
 
     @torch.no_grad()
-    def p_sample_ddpm(self, x_t, t, x_condition, clip_denoised=True):
-        """Sample one step from p(x_{t-1} | x_t)"""
+    def p_sample_ddpm(self, x_t, t, x_condition, y=None, operator=None, clip_denoised=True):
+        """
+        Single-step reverse diffusion sampling from timestep t to t-1.
+        
+        Supports two sampling approaches:
+        1. DDPM (default): Stochastic sampling using q(x_{t-1}|x_t,x_0) parameterized by p(x_{t-1}|x_t, x_0_hat)
+        2. SDE (optional): Score-based update using Euler-Maruyama discretization
+        
+        Sampling methods:
+        - p(x): Unconditional generation
+        - p(x|y):cond: Conditional generation (via concatenated input)
+        - p(x|y):sdedit: Image editing (starts from noisy observation)
+        - p(x|y):dps: Diffusion posterior sampling (measurement-guided generation)
+        
+        Args:
+            x_t: Noisy sample at timestep t, shape [B, C, H, W] or [B, C]
+            t: Current timestep [B]
+            x_condition: Conditional input (if conditional=True)
+            y: Observation/measurement (for DPS or SDEdit)
+            operator: Observation operator A(x) (for DPS, e.g., downsampling)
+            clip_denoised: Clip x_0 prediction to [-5, 5]
+        
+        Returns:
+            x_{t-1}: Denoised sample at timestep t-1
+        """
         b, *_, device = *x_t.shape, x_t.device
-        model_mean, _, model_log_variance = self.p_mean_variance(x_t, t, x_condition, clip_denoised)
+
+        # get model prediction 
+        if self.conditional:
+            model_output = self.denoiser(torch.cat([x_condition, x_t], dim=1), t)
+        else:
+            model_output = self.denoiser(x_t, t)
+
+        # get predicted x0 and prior score 
+        if self.objective == "pred_eps":
+            x_start_pred = self._predict_start_from_noise(x_t, t=t, noise=model_output)
+            score_prior = self._predict_score_from_noise(x_t, t=t, noise=model_output)
+        elif self.objective == "pred_x0":
+            x_start_pred = model_output
+            score_prior = self._predict_score_from_start(x_t, t=t, x_start=x_start_pred)
+
+        # compute likelihood score for DPS (Diffusion Posterior Sampling)
+        likelihood_score = None
+        if self.sample_method == 'p(x|y):dps' and y is not None and operator is not None:
+            with torch.enable_grad():
+                # create a gradient-enabled copy of x_t
+                x_t_temp = x_t.detach().clone().requires_grad_(True)
+                
+                # forward pass to get x_0 prediction (with gradient tracking)
+                if self.conditional:
+                    model_output_temp = self.denoiser(torch.cat([x_condition, x_t_temp], dim=1), t)
+                else:
+                    model_output_temp = self.denoiser(x_t_temp, t)
+                if self.objective == "pred_eps":
+                    x_0_pred = self._predict_start_from_noise(x_t_temp, t=t, noise=model_output_temp)
+                elif self.objective == "pred_x0":
+                    x_0_pred = model_output_temp
+                
+                # apply observation operator to predicted x_0
+                y_pred = operator(x_0_pred)
+                
+                # compute measurement consistency loss
+                # NOTE: Assumes Gaussian observation noise (DPS paper eq.16)
+                measurement_loss = nn.functional.mse_loss(y_pred, y, reduction='sum')
+                
+                # compute gradient of loss w.r.t. x_t: ∇_{x_t} L
+                grad_xt = torch.autograd.grad(measurement_loss, x_t_temp)[0]
+            
+            # turn to score
+            # NOTE: Unlike DPS paper (direct x_t adjustment), we use score format 
+            # for unified compatibility with both DDPM and SDE samplers
+            # Score formula: -∇L / σ²_t, where σ²_t = (1-ᾱ_t)
+            likelihood_score = - grad_xt / (self._extract_into_tensor(
+                self.sqrt_one_minus_alphas_cumprod, t, x_t.shape
+            ) ** 2)
+
+        # combine prior score and likelihood score if needed
+        if likelihood_score is not None:
+            score = score_prior + likelihood_score
+            x_start_pred = self._predict_start_from_score(x_t, t=t, score=score) # renew x0 prediction
+        else:
+            score = score_prior
+
+        # clip denoised x0 if needed
+        if clip_denoised:
+            x_start_pred.clamp_(-5., 5.)
+
+        # DDPM posterior
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_start_pred, x_t=x_t, t=t)
+
+        # SDE posterior (Euler-Maruyama)
+        # beta_t = self._extract_into_tensor(self.betas, t, x_t.shape)
+        # model_mean = x_t - 0.5 * beta_t * (x_t + 2.0 * score) 
+
+        # add noise 
         noise = self._make_noise(x_t.shape, device, repeat=False)
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x_t.shape) - 1)))
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+        return model_mean + nonzero_mask * (0.5 * posterior_log_variance).exp() * noise
 
     @torch.no_grad()
-    def p_sample_ddim(self, x_t, t, t_prev, x_condition, clip_denoised=True, eta=0.0):
+    def p_sample_ddim(self, x_t, t, t_prev, x_condition, y=None, operator=None, clip_denoised=True, eta=0.0):
         """
         DDIM sampling: one step from x_t to x_{t_prev}
         
@@ -321,32 +487,73 @@ class GaussianDiffusion(nn.Module):
         Returns:
             x_{t_prev}: sample at timestep t_prev
         """
+        b, *_, device = *x_t.shape, x_t.device
+
         # Get model prediction
         if self.conditional:
             model_output = self.denoiser(torch.cat([x_condition, x_t], dim=1), t)
         else:
             model_output = self.denoiser(x_t, t)
-        
+    
         # Predict x_0 from model output
-        if self.objective == "pred_noise":
+        if self.objective == "pred_eps":
             pred_noise = model_output
-            x_0_pred = self._predict_start_from_noise(x_t, t, pred_noise)
+            x_start_pred = self._predict_start_from_noise(x_t, t, pred_noise)
+            score_prior = self._predict_score_from_noise(x_t, t=t, noise=pred_noise)
         elif self.objective == "pred_x0":
-            x_0_pred = model_output
-            # Predict noise from x_0: ε = (x_t - √ᾱ_t · x_0) / √(1-ᾱ_t)
-            pred_noise = (
-                self._extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * 
-                (x_t - self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_0_pred)
-            )
-        
+            x_start_pred = model_output
+            score_prior = self._predict_score_from_start(x_t, t=t, x_start=x_start_pred)
+            pred_noise = self._predict_noise_from_start(x_t, t, x_start_pred)
+
+        # Compute likelihood score for DPS guidance
+        likelihood_score = None
+        if self.sample_method == 'p(x|y):dps' and y is not None and operator is not None:
+            with torch.enable_grad():
+                # Create gradient-enabled copy of x_t
+                x_t_temp = x_t.detach().clone().requires_grad_(True)
+                
+                # Forward pass to get x_0 prediction (with gradient tracking)
+                if self.conditional:
+                    model_output_temp = self.denoiser(torch.cat([x_condition, x_t_temp], dim=1), t)
+                else:
+                    model_output_temp = self.denoiser(x_t_temp, t)
+                
+                if self.objective == "pred_eps":
+                    x_0_pred_temp = self._predict_start_from_noise(x_t_temp, t=t, noise=model_output_temp)
+                elif self.objective == "pred_x0":
+                    x_0_pred_temp = model_output_temp
+                
+                # Apply observation operator and compute loss
+                y_pred = operator(x_0_pred_temp)
+                measurement_loss = nn.functional.mse_loss(y_pred, y, reduction='sum')
+                
+                # Compute gradient w.r.t. x_t
+                grad_xt = torch.autograd.grad(measurement_loss, x_t_temp)[0]
+            
+            # Convert gradient to likelihood score
+            # Score formula: -∇L / σ²_t, where σ²_t = (1-ᾱ_t)
+            likelihood_score = - grad_xt / (self._extract_into_tensor(
+                self.sqrt_one_minus_alphas_cumprod, t, x_t.shape
+            ) ** 2)
+
+        # Combine prior and likelihood scores
+        if likelihood_score is not None:
+            score = score_prior + likelihood_score
+            x_start_pred = self._predict_start_from_score(x_t, t=t, score=score)
+            # Recompute noise prediction from updated x_0
+            pred_noise = self._predict_noise_from_start(x_t, t, x_start_pred)
+        else:
+            score = score_prior
+
         # Clip predicted x_0 if needed
         if clip_denoised:
-            x_0_pred = x_0_pred.clamp(-5., 5.)
+            x_start_pred = x_start_pred.clamp(-5., 5.)
         
         # Extract alpha values
         alpha_t = self._extract_into_tensor(self.alphas_cumprod, t, x_t.shape)
         alpha_t_prev = self._extract_into_tensor(self.alphas_cumprod, t_prev, x_t.shape)
         
+        # DDIM update: x_{t-1} = √ᾱ_{t-1} · x̂_0 + √(1-ᾱ_{t-1}-σ_t²) · ε_θ + σ_t · ε
         # Compute sigma for the stochastic term
         # σ_t = η · √((1-ᾱ_{t-1})/(1-ᾱ_t)) · √(1-ᾱ_t/ᾱ_{t-1})
         sigma_t = (
@@ -361,7 +568,7 @@ class GaussianDiffusion(nn.Module):
         dir_xt = dir_xt_coef * pred_noise
         
         # DDIM update: x_{t-1} = √ᾱ_{t-1} · x̂_0 + √(1-ᾱ_{t-1}-σ_t²) · ε_θ + σ_t · ε
-        x_t_prev_mean = torch.sqrt(alpha_t_prev) * x_0_pred + dir_xt
+        x_t_prev_mean = torch.sqrt(alpha_t_prev) * x_start_pred + dir_xt
         
         # Add stochastic term if eta > 0
         if eta > 0:
@@ -369,61 +576,47 @@ class GaussianDiffusion(nn.Module):
             x_t_prev = x_t_prev_mean + sigma_t * noise
         else:
             x_t_prev = x_t_prev_mean
+
+        # Alternative: SDE update (Euler-Maruyama discretization)
+        # beta_t = self._extract_into_tensor(self.betas, t, x_t.shape)
+        # x_t_prev_mean = x_t - 0.5 * beta_t * (x_t + 2.0 * score)
+        # noise = torch.randn_like(x_t)
+        # nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x_t.shape) - 1)))
+        # x_t_prev = x_t_prev_mean + nonzero_mask * torch.sqrt(beta_t) * noise
         
         return x_t_prev    
     
     @torch.no_grad()
-    def p_sample_ddpm_loop(self, x, continuous=False, device=None):
+    def p_sample_ddpm_loop(self, x, continuous=False, operator=None, device=None):
         """Generate samples from p(x_0) by iteratively applying p(x_{t-1} | x_t) from Gaussian noise"""
-        sample_inter = (1 | (self.num_timesteps // 10))
-
-        shape = x['x_t'].shape
-        img = x['x_t'] #torch.randn(shape, device=device)
+        batch_size = x['x_t'].size(0)
+        img = x['x_t'] 
+        sample_inter = max(1, self.num_timesteps // 10)
         ret_img = img if continuous else None
 
         for i in tqdm.tqdm(reversed(range(0, self.start_t+1)), desc='DDPM sampling', total=self.start_t):
-            img = self.p_sample_ddpm(img, 
-                                     torch.full((shape[0],), i, device=device, dtype=torch.long), # time step t
-                                     x['cond'] if self.conditional else None, 
-                                     clip_denoised=True)
+            img = self.p_sample_ddpm(
+                img, 
+                torch.full((batch_size,), i, device=device, dtype=torch.long), # time step t
+                x['cond'] if self.conditional else None, 
+                x['y'] if 'y' in x else None,
+                operator=operator,
+                clip_denoised=True
+            )
             if continuous and i % sample_inter == 0:
                 ret_img = torch.cat([ret_img, img], dim=0)
         
-        if continuous:
-            return ret_img
-        else:
-            return img
+        return ret_img if continuous else img
     
     @torch.no_grad()
-    def p_sample_ddim_loop(self, x, continuous=False, device=None):
-        """
-        DDIM sampling loop with accelerated sampling using fewer timesteps.
-        
-        DDIM allows skipping timesteps, enabling faster sampling than DDPM.
-        For example, with 1000 training steps, we can sample with only 50 steps.
-        
-        Args:
-            x: dict containing 'x_start' for shape and optionally 'x_condition'
-            ddim_timesteps: number of sampling steps (can be < num_timesteps for acceleration)
-            ddim_eta: controls stochasticity (0=deterministic, 1=stochastic)
-            continuous: whether to return intermediate samples
-        
-        Returns:
-            Generated sample(s)
-        """
+    def p_sample_ddim_loop(self, x, continuous=False, operator=None, device=None):
+        """DDIM sampling loop with accelerated sampling and optional guidance."""
         batch_size = x['x_t'].size(0)
-        
-        # Start from random noise
-        #shape = (batch_size, 1, x['x_t'].size(2), x['x_t'].size(3))
-        img = x['x_t'] #torch.randn(shape, device=device)
-        
+        img = x['x_t'] 
         ddim_timesteps = self.ddim_timesteps.tolist() if isinstance(self.ddim_timesteps, np.ndarray) else self.ddim_timesteps
-
-        # For continuous output
         sample_inter = max(1, len(ddim_timesteps) // 10)
         ret_img = img if continuous else None
         
-        # DDIM sampling loop
         for i in tqdm.tqdm(reversed(range(len(ddim_timesteps))), desc='DDIM sampling', total=len(ddim_timesteps)):
             # Determine previous timestep
             t_curr = ddim_timesteps[i]
@@ -439,38 +632,25 @@ class GaussianDiffusion(nn.Module):
                 t_curr_tensor,
                 t_prev_tensor,
                 x['cond'] if self.conditional else None,
+                x['y'] if 'y' in x else None,
+                operator=operator,
                 clip_denoised=True,
                 eta=self.ddim_eta
             )
             
-            # Store intermediate results if continuous
             if continuous and i % sample_inter == 0:
                 ret_img = torch.cat([ret_img, img], dim=0)
         
-        if continuous:
-            return ret_img
-        else:
-            return img
+        return ret_img if continuous else img
         
     @torch.no_grad()
-    def sample(self, x, num_samples, continuous=False, device=None):
-        """
-        Generate samples from p(x_0) using different sampling solvers.
-        
-        Args:
-            x: input dict with 'x_start' and optionally 'x_condition'
-            continuous: whether to return intermediate samples
-            ddim_timesteps: number of sampling steps for DDIM (only used when solver='ddim')
-            ddim_eta: stochasticity parameter for DDIM (0=deterministic, 1=stochastic)
-        
-        Returns:
-            Generated sample(s)
-        """
+    def sample(self, x, num_samples, continuous=False, operator=None, device=None):
+        """Generate samples from p(x0) using different sampling solvers."""
         x = self._prepare_data_for_sampling(x, num_samples, device=device)
         if self.solver == 'ddim':
-            return self.p_sample_ddim_loop(x, continuous, device=device)
+            return self.p_sample_ddim_loop(x, continuous, operator, device=device)
         elif self.solver == 'ddpm': 
-            return self.p_sample_ddpm_loop(x, continuous, device=device)
+            return self.p_sample_ddpm_loop(x, continuous, operator, device=device)
 
 ##############################################################################
 # Calculate loss function for training
@@ -490,7 +670,7 @@ class GaussianDiffusion(nn.Module):
             model_output = self.denoiser(x_t, t)
         
         # calculate loss
-        if self.objective == "pred_noise":
+        if self.objective == "pred_eps":
             target = noise
         elif self.objective == "pred_x0":
             target = x['x0']
